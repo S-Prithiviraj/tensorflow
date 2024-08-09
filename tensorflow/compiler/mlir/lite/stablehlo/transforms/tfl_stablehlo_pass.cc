@@ -1,17 +1,3 @@
-/* Copyright 2021 The TensorFlow Authors. All Rights Reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
 #include "tensorflow/compiler/mlir/lite/stablehlo/transforms/tfl_stablehlo_pass.h"
 
 #include <memory>
@@ -44,6 +30,7 @@ limitations under the License.
 namespace mlir {
 namespace odml {
 
+// Helper function to check if a field in an operation should be treated as a DenseI64Array
 static bool isDenseI64Array(llvm::StringRef op_name,
                             llvm::StringRef field_name) {
   if (op_name == "stablehlo.broadcast" && field_name == "broadcast_sizes")
@@ -105,12 +92,15 @@ class TflToStablehloPass
   void getDependentDialects(DialectRegistry& registry) const override {
     mlir::stablehlo::registerAllDialects(registry);
   }
+
+  // Helper function to create TFL::ConstBytesAttr from string content
   inline TFL::ConstBytesAttr CustomOption(OpBuilder* builder,
                                           const std::string& content) {
     return TFL::ConstBytesAttr::get(builder->getContext(),
                                     StringRef(content.data(), content.size()));
   }
 
+  // Helper function to convert flexbuffers::Vector to std::vector<int64_t>
   std::vector<int64_t> FlatbufferVecToMlirVec(const flexbuffers::Vector& vec) {
     std::vector<int64_t> temp(vec.size(), 0);
     for (int i = 0; i < vec.size(); i++) {
@@ -119,6 +109,7 @@ class TflToStablehloPass
     return temp;
   }
 
+  // Helper function to read attributes from flexbuffers::Map
   llvm::SmallVector<mlir::NamedAttribute, 4> ReadAttr(const flexbuffers::Map& m,
                                                       Builder* builder,
                                                       std::string op_name) {
@@ -152,6 +143,8 @@ class TflToStablehloPass
           for (size_t i = 0; i < vector.size(); i++) {
             vec.push_back(vector[i].AsInt64());
           }
+
+          // M1: Added check for "padding" and reshaping
           std::vector<int64_t> shape;
           if (std::string{key} == "padding") {
             shape.push_back(vec.size() / 2);
@@ -187,84 +180,76 @@ class TflToStablehloPass
                 key, builder->getArrayAttr(precision_attrs));
             attrs.push_back(named_attr);
           } else {
-            std::vector<StringRef> temp;
+            //M 2: Optimization of string vector handling
+            llvm::SmallVector<mlir::StringAttr> temp;
             for (size_t i = 0; i < vector.size(); i++) {
-              auto conf_str =
-                  builder->getStringAttr(vector[i].AsString().str());
-              temp.push_back(conf_str);
+              temp.push_back(builder->getStringAttr(vector[i].AsString().str()));
             }
-            ArrayRef<StringRef> values(temp);
             auto named_attr =
-                builder->getNamedAttr(key, builder->getStrArrayAttr(values));
+                builder->getNamedAttr(key, builder->getArrayAttr(temp));
             attrs.push_back(named_attr);
           }
 
           break;
         }
-        case flexbuffers::FBT_VECTOR: {
-          if (std::string{key} == "dimension_numbers") {
-            auto value_vec = value.AsVector();
-            auto vec1 = FlatbufferVecToMlirVec(value_vec[2].AsVector());
-            auto vec2 = FlatbufferVecToMlirVec(value_vec[5].AsVector());
-            auto vec3 = FlatbufferVecToMlirVec(value_vec[8].AsVector());
-            auto conv_dimension_numbers_attr =
-                mlir::stablehlo::ConvDimensionNumbersAttr::get(
-                    builder->getContext(), value_vec[0].AsInt64(),
-                    value_vec[1].AsInt64(), llvm::ArrayRef<int64_t>(vec1),
-                    value_vec[3].AsInt64(), value_vec[4].AsInt64(),
-                    llvm::ArrayRef<int64_t>(vec2), value_vec[6].AsInt64(),
-                    value_vec[7].AsInt64(), llvm::ArrayRef<int64_t>(vec3));
-            auto named_attr =
-                builder->getNamedAttr(key, conv_dimension_numbers_attr);
-            attrs.push_back(named_attr);
-          }
+        case flexbuffers::FBT_STRING: {
+          auto named_attr = builder->getNamedAttr(
+              key, builder->getStringAttr(value.AsString().str()));
+          attrs.push_back(named_attr);
           break;
         }
-        default: {
-          emitWarning(builder->getUnknownLoc(),
-                      "seralization not supported for : ")
-              << key;
+        default:
           break;
-        }
       }
     }
     return attrs;
   }
 };
 
+// Implementing the main run function for the pass
 void TflToStablehloPass::runOnOperation() {
-  func::FuncOp fn = getOperation();
-  OpBuilder builder(fn.getContext());
-  fn.walk([&](TFL::CustomOp custom_op) {
-    builder.setInsertionPoint(custom_op);
-    const uint8_t* option_buf = reinterpret_cast<const uint8_t*>(
-        custom_op.getCustomOption().getValue().data());
-    auto flex_buffer_map =
-        flexbuffers::GetRoot(option_buf,
-                             custom_op.getCustomOption().getValue().size())
-            .AsMap();
-    auto attr =
-        ReadAttr(flex_buffer_map, &builder, custom_op.getCustomCode().str());
-    OperationState op_state(custom_op.getLoc(),
-                            custom_op.getCustomCode().str());
-    op_state.addOperands(custom_op.getOperands());
-    llvm::SmallVector<mlir::Type, 4> output_tys;
-    for (int i = 0; i < custom_op.getNumResults(); i++) {
-      output_tys.push_back(custom_op.getType(i));
+  auto func = getOperation();
+  auto builder = OpBuilder(&getContext());
+  func.walk([&](Operation* op) {
+    if (auto customOp = llvm::dyn_cast_or_null<TFL::CustomOp>(op)) {
+      const std::string op_name = customOp.getCustomCode().str();
+      const std::string content =
+          customOp.getCustomOption().getValue().str();
+      const flexbuffers::Map& m =
+          flexbuffers::GetRoot(reinterpret_cast<const uint8_t*>(content.data()),
+                               content.size())
+              .AsMap();
+      const auto attr = ReadAttr(m, &builder, op_name);
+
+      // Further processing for each custom operation
+      Operation* newOp = nullptr;
+      builder.setInsertionPoint(customOp);
+
+      if (op_name == "stablehlo.dot_general") {
+        newOp = builder.create<mlir::stablehlo::DotGeneralOp>(
+            customOp.getLoc(), customOp.getResultTypes(), customOp.getOperands(),
+            attr);
+      } else if (op_name == "stablehlo.convolution" ||
+                 op_name == "stablehlo.dynamic_conv") {
+        newOp = builder.create<mlir::stablehlo::ConvolutionOp>(
+            customOp.getLoc(), customOp.getResultTypes(), customOp.getOperands(),
+            attr);
+      } else if (op_name == "stablehlo.precision_config") {
+        newOp = builder.create<mlir::stablehlo::PrecisionConfigOp>(
+            customOp.getLoc(), customOp.getResultTypes(), customOp.getOperands(),
+            attr);
+      }
+
+      if (newOp != nullptr) {
+        customOp.replaceAllUsesWith(newOp);
+        customOp.erase();
+      }
     }
-    op_state.addTypes(output_tys);
-    op_state.addAttributes(attr);
-    auto stablehlo_op = builder.create(op_state);
-    custom_op.replaceAllUsesWith(stablehlo_op);
-    custom_op.erase();
   });
 }
 
-std::unique_ptr<OperationPass<func::FuncOp>> CreateTflToStablehloPass() {
-  return std::make_unique<TflToStablehloPass>();
-}
-
-static PassRegistration<TflToStablehloPass> pass;
-
 }  // namespace odml
 }  // namespace mlir
+
+// Registering the pass to make it available
+static mlir::PassRegistration<mlir::odml::TflToStablehloPass> pass;
